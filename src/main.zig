@@ -7,22 +7,30 @@ const testing = std.testing;
 
 pub fn Path(comptime Pos: type) type {
     return struct {
+        const Self = Path(Pos);
+
         path: ArrayList(Pos),
         current: Pos,
+        allocator: Allocator,
 
-        pub fn init(current: Pos, allocator: Allocator) Path(Pos) {
-            return Path(Pos){
-                .path = ArrayList(Pos).init(allocator),
+        pub fn init(current: Pos, allocator: Allocator) Allocator.Error!Self {
+            return Self{
+                .path = try ArrayList(Pos).initCapacity(allocator, 4),
                 .current = current,
+                .allocator = allocator,
             };
         }
 
-        pub fn deinit(self: *Path(Pos)) void {
-            self.path.deinit();
+        pub fn append(self: *Self, gpa: Allocator, pos: Pos) Allocator.Error!void {
+            try self.path.append(gpa, pos);
         }
 
-        pub fn dup(self: *Path(Pos)) !Path(Pos) {
-            return Path(Pos){ .path = try self.path.clone(), .current = self.current };
+        pub fn deinit(self: *Self) void {
+            self.path.deinit(self.allocator);
+        }
+
+        pub fn dup(self: *Self) !Self {
+            return Self{ .path = try self.path.clone(self.allocator), .current = self.current, .allocator = self.allocator };
         }
     };
 }
@@ -46,10 +54,12 @@ pub fn Astar(comptime Pos: type, distance: fn (Pos, Pos) usize) type {
         end: Pos,
         allocator: Allocator,
 
-        pub fn init(start: Pos, allocator: Allocator) Self {
+        pub fn init(start: Pos, allocator: Allocator) Allocator.Error!Self {
+            var seen = try ArrayList(Pos).initCapacity(allocator, 4);
+            try seen.append(allocator, start);
             return Self{
-                .next_q = NextQueue.init(allocator, start),
-                .seen = ArrayList(Pos).init(allocator),
+                .next_q = NextQueue.initContext(start),
+                .seen = seen,
                 .start = start,
                 .end = start,
                 .allocator = allocator,
@@ -57,59 +67,63 @@ pub fn Astar(comptime Pos: type, distance: fn (Pos, Pos) usize) type {
         }
 
         pub fn deinit(self: *Self) void {
-            self.next_q.deinit();
-            self.seen.deinit();
+            for (self.next_q.items) |*path| {
+                path.deinit();
+            }
+
+            self.next_q.deinit(self.allocator);
+            self.seen.deinit(self.allocator);
         }
 
         pub fn pathFind(self: *Self, start: Pos, end: Pos) !Result(Pos) {
             self.next_q.items.len = 0;
             self.seen.items.len = 0;
-            try self.seen.append(start);
+            try self.seen.append(self.allocator, start);
             self.end = end;
-            try self.next_q.add(Path(Pos).init(start, self.allocator));
+            try self.next_q.push(self.allocator, try Path(Pos).init(start, self.allocator));
 
             return Result(Pos){ .neighbors = start };
         }
 
         pub fn step(self: *Self, neighbors: []Pos) !Result(Pos) {
-            if (self.next_q.items.len == 0) {
-                return Result(Pos).no_path;
-            }
-
-            var best = self.next_q.remove();
-            for (neighbors) |neighbor| {
-                if (std.meta.eql(neighbor, self.end)) {
-                    try best.path.append(best.current);
-                    try best.path.append(self.end);
-                    best.current = self.end;
-                    return Result(Pos){ .done = best };
-                }
-
-                var found: bool = false;
-                var i: usize = 0;
-                while (i < self.seen.items.len) : (i += 1) {
-                    if (std.meta.eql(neighbor, self.seen.items[i])) {
-                        found = true;
-                        break;
+            if (self.next_q.pop()) |popd| {
+                var best = popd;
+                for (neighbors) |neighbor| {
+                    if (std.meta.eql(neighbor, self.end)) {
+                        try best.append(self.allocator, best.current);
+                        try best.append(self.allocator, self.end);
+                        best.current = self.end;
+                        return Result(Pos){ .done = best };
                     }
-                }
-                if (found) {
-                    continue;
-                }
-                try self.seen.append(neighbor);
 
-                var new_path = try best.dup();
-                try new_path.path.append(best.current);
+                    var found: bool = false;
+                    var i: usize = 0;
+                    while (i < self.seen.items.len) : (i += 1) {
+                        if (std.meta.eql(neighbor, self.seen.items[i])) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (found) {
+                        continue;
+                    }
+                    try self.seen.append(self.allocator, neighbor);
 
-                new_path.current = neighbor;
-                try self.next_q.add(new_path);
+                    var new_path = try best.dup();
+                    try new_path.append(self.allocator, best.current);
+
+                    new_path.current = neighbor;
+                    try self.next_q.push(self.allocator, new_path);
+                }
+
+                best.deinit();
+
+                const new_best = self.next_q.peek() orelse unreachable;
+
+                return Result(Pos){ .neighbors = new_best.current };
             }
 
-            best.deinit();
-
-            const new_best = self.next_q.peek() orelse unreachable;
-
-            return Result(Pos){ .neighbors = new_best.current };
+            return Result(Pos).no_path;
         }
 
         pub fn compare(end: Pos, first: Path(Pos), second: Path(Pos)) Order {
@@ -144,14 +158,14 @@ const Map = struct {
 };
 
 test "pathfinding" {
-    const allocator = std.heap.page_allocator;
+    const allocator = std.testing.allocator;
 
     const PathFinder = Astar(SimplePos, simple_distance);
 
     const start = SimplePos.init(0, 0);
     const end = SimplePos.init(4, 4);
 
-    var finder = PathFinder.init(start, allocator);
+    var finder = try PathFinder.init(start, allocator);
     defer finder.deinit();
 
     const blocked: [5][]const bool =
@@ -165,8 +179,8 @@ test "pathfinding" {
     const map = Map.init(blocked[0..]);
 
     var result = try finder.pathFind(start, end);
-    var neighbors = ArrayList(SimplePos).init(allocator);
-    defer neighbors.deinit();
+    var neighbors = try ArrayList(SimplePos).initCapacity(allocator, 4);
+    defer neighbors.deinit(allocator);
 
     while (result == .neighbors) {
         const pos = result.neighbors;
@@ -185,12 +199,15 @@ test "pathfinding" {
                     continue;
                 }
                 const next_pos = SimplePos.init(new_x, new_y);
-                try neighbors.append(next_pos);
+                try neighbors.append(allocator, next_pos);
             }
         }
 
         result = try finder.step(neighbors.items);
     }
+
+    defer result.done.deinit();
+
     try testing.expectEqual(Result(SimplePos).done, @as(std.meta.Tag(Result(SimplePos)), result));
 
     try testing.expectEqual(SimplePos.init(0, 0), result.done.path.items[0]);
